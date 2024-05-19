@@ -17,65 +17,19 @@ class Auth0Settings(BaseModel):
     auth_base_url: str
 
 
-class CustomAsyncOAuth2Client(AsyncOAuth2Client):
-
-    def __init__(
-        self,
-        authorization_base_url: str,
-        audience: str,
-        cache=None,
-        token_cache_buffer: int = 300,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.cache = cache
-        self.authorization_base_url = authorization_base_url
-        self.audience = audience
-        self.token_cache_buffer = token_cache_buffer
-
-    async def fetch_token(self, *args, **kwargs):
-        # Get from memory
-        if self.token and not self.token.is_expired():
-            logger.info("Using m2m token from memory")
-            return self.token
-
-        # Get from cache
-        logger.info("No m2m token found in memory. Fetching token from cache")
-        key = f"{self.client_id}{self.audience}"
-        token = self.cache.get(key)
-        if token and not token.is_expired():
-            logger.info("Retrieved token from the cache")
-            self.token = token
-            return token
-
-        # Get from token endpoint
-        logger.info("No m2m token found in cache. Fetching token from token endpoint")
-        token = await super().fetch_token(
-            self.authorization_base_url,
-            audience=self.audience,
-            grant_type="client_credentials",
-            **kwargs,
-        )
-        # Save the token to the cache
-        logger.info("Saving m2m token to cache")
-
-        ttl = token.get("expires_in") - self.token_cache_buffer
-        if ttl < 0:
-            ttl = token.get("expires_in")
-        self.cache.set(key, token, ttl)
-
-        return token
-
-
 class BaseServiceClient:
 
     def __init__(
         self,
         auth0_settings: Optional[Auth0Settings] = None,
         client: Optional[AsyncOAuth2Client] = None,
+        cache=None,
+        token_cache_buffer: int = 300,
     ):
         self._auth0_settings = auth0_settings
         self._client = client
+        self.cache = cache
+        self.token_cache_buffer = token_cache_buffer
 
     @property
     def auth0_settings(self):
@@ -90,18 +44,14 @@ class BaseServiceClient:
         return self._auth0_settings
 
     @property
-    def client(self):
+    async def client(self):
         """Return the 0Auth2 client. If it does not exist, create it and fetch the token."""
         if self._client is None:
             self._client = AsyncOAuth2Client(
                 client_id=self.auth0_settings.client_id,
                 client_secret=self.auth0_settings.client_secret,
             )
-            self._client.fetch_token(
-                url=self.auth0_settings.auth_base_url,
-                grant_type="client_credentials",
-                audience=self.auth0_settings.audience,
-            )
+            await self.authorise_client()
         return self._client
 
     async def __aenter__(self):
@@ -114,3 +64,35 @@ class BaseServiceClient:
         """Close the httpx client to terminate any open connections."""
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
+
+    async def authorise_client(self):
+        # Get from memory
+        if self.client.token and not self.client.token.is_expired():
+            logger.info("Using m2m token from memory")
+            return
+
+        # Get from cache
+        logger.info("No m2m token found in memory. Fetching token from cache")
+        key = f"{self.auth0_settings.client_id}{self.auth0_settings.audience}"
+        token = self.cache.get(key)
+        if token and not token.is_expired():
+            logger.info("Retrieved token from the cache")
+            self.client.token = token
+            return
+
+        # Get from token endpoint
+        logger.info("No m2m token found in cache. Fetching token from token endpoint")
+        token = await self.client.fetch_token(
+            self.auth0_settings.auth_base_url,
+            audience=self.auth0_settings.audience,
+            grant_type="client_credentials",
+        )
+        # Save the token to the cache
+        logger.info("Saving m2m token to cache")
+
+        ttl = token.get("expires_in") - self.token_cache_buffer
+        if ttl < 0:
+            ttl = token.get("expires_in")
+        self.cache.set(key, token, ttl)
+
+        return token
